@@ -5,7 +5,12 @@
 # Any message sent to primaryEmailAddressOfUserToBeDecommissioned ends up in the mailbox of primaryEmailAddressOfUserToBeDecommissioned
 # and in the mailboxes specified by redirectDestinations.  The sender will receive a bounceback message.
 
+#To get pre-requisites:
+# Install-Module -Confirm:$false -Force -Name 'AzureAD', 'ExchangeOnlineManagement', 'PnP.PowerShell'
+
 [CmdletBinding()]
+
+
 Param (
 
     [String]$primaryEmailAddressOfUserToBeDecommissioned,
@@ -36,26 +41,45 @@ without triggering a "could-not-find address" bounceback.
     [String]$emailAliasToAdviseSendersToSendTo  = 'info',
 
     [Parameter(HelpMessage=
-        "The path of the powershell script to dot source in order to ensure that we are connected to the appropriate cloud administration modules."
+        "The script block that will, when dot-sourced, ensure that we are connected to the appropriate cloud administration modules."
     )]
-    [String]$pathOfScriptToConnectToCloud,
+    [ScriptBlock]$scriptBlockToConnectToCloud,
     
     [Parameter(HelpMessage=
         "specifies whether to set the automapping property on the mailbox permissions that we assign to usersToBeGrantedFullAccess"
     )]
-    [Boolean]$automapping=$false
+    [Boolean]$automapping=$false,
     
-    
+    [Parameter(HelpMessage=
+        "specify either RedirectByMeansOfAnInboxRule or RedirectByMeansOfATransportRule"
+    )]
+    # [RedirectionStrategy]$redirectionStrategy=[RedirectionStrategy]::RedirectByMeansOfAnInboxRule
+    [String]$redirectionStrategy='RedirectByMeansOfAnInboxRule'
+
 )
+
 
 Begin {
     Write-Host "Now decommissioning user $primaryEmailAddressOfUserToBeDecommissioned"
     
     #dot source the script to connect to the appropriate cloud administration modules
-    . $pathOfScriptToConnectToCloud
+    . $scriptBlockToConnectToCloud
+    
+    
+
+    enum RedirectionStrategy
+    {
+       RedirectByMeansOfATransportRule
+       RedirectByMeansOfAnInboxRule
+    }
+    
+    $redirectionStrategy = ([RedirectionStrategy] $redirectionStrategy)
+
 }
 
 Process {
+    # Import-Module 'AzureAD', 'ExchangeOnlineManagement', 'PnP.PowerShell'
+    # TODO: remove licenses from the user, convert to shared mailbox, and (if possible) delete the newly-removed licenses from the tenant.
 
     $emailAddressToBeDecommissioned = $primaryEmailAddressOfUserToBeDecommissioned
     $primaryDomainName = (Get-AzureAdDomain | where {$_.IsDefault}).Name
@@ -79,8 +103,19 @@ Process {
     # need to invoke the help of an administrator in order to delete the transport rule.
     # the disadvantage of the inbox rule is that if a redirectionDestination is unreachable, a bounceback will show up in the decommissioned mailbox (which would be confusing 
     # to the decommissioned user if he ever was recommissioned.)
-    # $redirectDestinationsToBeHandledByTransportRule = @();    $redirectDestinationsToBeHandledByInboxRule     = $redirectDestinations[0..($redirectDestinations.Count - 1)]
-    $redirectDestinationsToBeHandledByInboxRule     = @();    $redirectDestinationsToBeHandledByTransportRule = $redirectDestinations[0..($redirectDestinations.Count - 1)]
+
+    Switch ($redirectionStrategy){
+        RedirectByMeansOfATransportRule {
+            $redirectDestinationsToBeHandledByTransportRule = $redirectDestinations[0..($redirectDestinations.Count - 1)]
+            $redirectDestinationsToBeHandledByInboxRule     = @();    
+        }
+        
+        RedirectByMeansOfAnInboxRule {
+            $redirectDestinationsToBeHandledByTransportRule = @();    
+            $redirectDestinationsToBeHandledByInboxRule     = $redirectDestinations[0..($redirectDestinations.Count - 1)]
+        }
+    }
+    
     
     
     $augmentedRedirectDestinations = $redirectDestinationsToBeHandledByTransportRule + $primaryEmailAddressOfUserToBeDecommissioned
@@ -183,3 +218,6 @@ Process {
 End {
     
 }
+
+
+

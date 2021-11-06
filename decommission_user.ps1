@@ -65,7 +65,9 @@ Begin {
     #dot source the script to connect to the appropriate cloud administration modules
     . $scriptBlockToConnectToCloud
     
-    
+    $sendAdvisoryMessageToDummyAddressInsteadOfRealRecipientAddress = $false
+    $dummyAddressForAdvisoryMessages = 'neil+test2@autoscaninc.com'
+    $emailAccountForSendingAdvisoryMessages = 'neil@autoscaninc.com'
 
     enum RedirectionStrategy
     {
@@ -75,11 +77,47 @@ Begin {
     
     $redirectionStrategy = ([RedirectionStrategy] $redirectionStrategy)
 
+    function unlockTheBitwardenVault(){
+        Write-Host "Attempting to unlock the bitwarden vault..."
+        if ($(bw unlock --check)) {
+            Write-Host "The bitwarden vault is already unlocked."
+        }
+        else { 
+            $env:BW_SESSION =  $(pwsh -Command "bw unlock --raw || bw login --raw") 
+        }
+    }
+    function sendMail($emailAccount, $from, $to, $subject, $body){
+        # unlock the bitwarden vault:
+        unlockTheBitwardenVault
+        $bitwardenItems = bw list items --raw --search 'AzureAD app Password' | ConvertFrom-Json | Where-Object {$_.name -eq 'AzureAD app password' -and $_.login.username -eq $emailAccount}
+        $bitwardenItemContainingEmailCredentials = $bitwardenItems[0]
+        if (! $bitwardenItemContainingEmailCredentials ){
+            Write-Error "unable to find a Bitwarden item corresponding to the email account $emailAccount"
+            return
+        }
+        
+        $SMTPClient = New-Object Net.Mail.SmtpClient(  
+            @($bitwardenItemContainingEmailCredentials.fields | Where-Object {$_.name -eq 'smtp_host'} | Foreach-object {$_.value})[0], 
+            @($bitwardenItemContainingEmailCredentials.fields | Where-Object {$_.name -eq 'smtp_port'} | Foreach-object {$_.value})[0] 
+        )   
+        $SMTPClient.EnableSsl = ([bool] ([int] @($bitwardenItemContainingEmailCredentials.fields | Where-Object {$_.name -eq 'smtp_enable_ssl'} | Foreach-object {$_.value})[0]))    
+        $SMTPClient.Credentials = New-Object System.Net.NetworkCredential($bitwardenItemContainingEmailCredentials.login.username, $bitwardenItemContainingEmailCredentials.login.password) 
+        
+        $mailMessage = New-Object Net.Mail.MailMessage
+        $mailMessage.From = New-Object System.Net.Mail.MailAddress($from)
+        $mailMessage.To.Add($to) 
+        $mailMessage.Subject = $subject
+        $mailMessage.Body = $body
+        $SMTPClient.Send($mailMessage)
+
+    }
 }
 
 Process {
     # Import-Module 'AzureAD', 'ExchangeOnlineManagement', 'PnP.PowerShell'
     # TODO: remove licenses from the user, convert to shared mailbox, and (if possible) delete the newly-removed licenses from the tenant.
+    unlockTheBitwardenVault
+    # unlockThebitwarden vault up front because we know it will need to be done to send the advisory email messages.
 
     $emailAddressToBeDecommissioned = $primaryEmailAddressOfUserToBeDecommissioned
     $primaryDomainName = (Get-AzureAdDomain | where {$_.IsDefault}).Name
@@ -182,7 +220,7 @@ Process {
     $recipes | foreach-object {& $_}
     
     #spit out the newly-created transport rules:
-    Get-TransportRule | where-object {$_.Name -match $transportRuleNamePattern} | select Name, Priority
+    Get-TransportRule | where-object {$_.Name -match $transportRuleNamePattern} | select-object Name, Priority
     
     
     $inboxRuleNamePattern = '^' + $ruleNamePrefix + '\d+' + '_.*' + '$'
@@ -190,17 +228,60 @@ Process {
     Write-Host "Found $($existingInboxRulesToRemove.Count) existing inbox rules that we will now remove."
     $existingInboxRulesToRemove | Remove-InboxRule -Confirm:$False
     $i=1
-    $newlyCreatedInboxRules = @(
-        foreach ( $redirectDestination in $redirectDestinationsToBeHandledByInboxRule ){
-            New-InboxRule `
-                -Confirm:$false  `
-                -Mailbox $emailAddressToBeDecommissioned   `
-                -Name ( $ruleNamePrefix + ($i++) + "_" + "redirect_to_" + $redirectDestination )     `
-                -HeaderContainsWords $magicHeader1Value `
-                -RedirectTo $redirectDestination  `
-                -StopProcessingRules:$false `
+    $newlyCreatedInboxRules = New-Object System.Collections.ArrayList
+    foreach ( $redirectDestination in $redirectDestinationsToBeHandledByInboxRule ){
+        $nameOfTheInboxRule = $ruleNamePrefix + ($i++) + "_" + "redirect_to_" + $redirectDestination
+        
+        $newlyCreatedInboxRule = New-InboxRule `
+            -Confirm:$false  `
+            -Mailbox $emailAddressToBeDecommissioned   `
+            -Name $nameOfTheInboxRule     `
+            -HeaderContainsWords $magicHeader1Value `
+            -RedirectTo $redirectDestination  `
+            -StopProcessingRules:$false `
+        
+        [void] $newlyCreatedInboxRules.Add($newlyCreatedInboxRule)
+
+        if ( $usersToBeGrantedFullAccess.Contains($redirectDestination) ){
+            # send an email to the user informing them about the redirect rule and 
+            # advising them how to turn it off.
+                    
+            $azureAdUserToBeAdvised = Get-AzureADUser -ObjectId $redirectDestination
+            $recipientAddress = ($azureAdUserToBeAdvised.DisplayName + "<" + $azureAdUserToBeAdvised.Mail + ">")
+
+            $xx = @{
+                emailAccount = $emailAccountForSendingAdvisoryMessages
+                from         = $emailAccountForSendingAdvisoryMessages
+                to           = $(if($sendAdvisoryMessageToDummyAddressInsteadOfRealRecipientAddress){$dummyAddressForAdvisoryMessages} else {$recipientAddress})
+                subject      = $(if($sendAdvisoryMessageToDummyAddressInsteadOfRealRecipientAddress){"(TO: $recipientAddress) " } else {""} ) + "$($azureAdUserToBeAdvised.DisplayName) will now receive messages sent to $emailAddressToBeDecommissioned"
+                body         = @( 
+                                    "Dear $($azureAdUserToBeAdvised.DisplayName), " 
+                                    ""
+                                    "An email forwarding rule has been created that will cause a copy of new messages sent to $emailAddressToBeDecommissioned "
+                                    "to be deposited into your inbox."
+                                    ""
+                                    "To turn off the forwarding rule that is causing this to happen, go to " + `
+                                    "https://outlook.office.com/mail/$emailAddressToBeDecommissioned/options/mail/rules " + `
+                                    "and click the button to turn off the rule named `"$nameOfTheInboxRule`"."
+                                    ""
+                                    ""
+                                    "Sincerely,"
+                                    "Neil Jackson"
+                                    "neil@autoscaninc.com"
+                                    "425-218-6726 (cell)"
+                                    "206-282-1616 ext. 102 (office)"
+                                    ""
+                                    "Autoscan, Inc."
+                                    "4040 23RD AVE W"
+                                    "SEATTLE WA 98199-1209"
+                                    "206-282-1616"
+                                ) -Join "`n"
+            }
+            sendMail @xx
         }
-    )
+
+    }
+    
     Write-Host "newlyCreatedInboxRules: "
     $newlyCreatedInboxRules
     
@@ -211,6 +292,44 @@ Process {
         Add-MailboxPermission   -Identity $emailAddressToBeDecommissioned -User    $userToBeGrantedFullAccess -AccessRights FullAccess -Automapping $automapping 
         
         Add-RecipientPermission -Identity $emailAddressToBeDecommissioned -Trustee $userToBeGrantedFullAccess -AccessRights SendAs  -confirm:$false
+
+        # send an email to the user informing them that they now have full access to the mailbox and how to access it.
+        
+        $azureAdUserToBeAdvised = Get-AzureADUser -ObjectId $userToBeGrantedFullAccess
+        $recipientAddress = ($azureAdUserToBeAdvised.DisplayName + "<" + $azureAdUserToBeAdvised.Mail + ">")
+
+        $xx = @{
+            emailAccount = $emailAccountForSendingAdvisoryMessages
+            from         = $emailAccountForSendingAdvisoryMessages
+            to           = $(if($sendAdvisoryMessageToDummyAddressInsteadOfRealRecipientAddress){$dummyAddressForAdvisoryMessages} else {$recipientAddress})
+            subject      = $(if($sendAdvisoryMessageToDummyAddressInsteadOfRealRecipientAddress){"(TO: $recipientAddress) " } else {""} ) + "$($azureAdUserToBeAdvised.DisplayName) now has full access to the $emailAddressToBeDecommissioned mailbox"
+            body         = @( 
+                                "Dear $($azureAdUserToBeAdvised.DisplayName), " 
+                                ""
+                                "You now have full access to the $emailAddressToBeDecommissioned mailbox."
+                                ""
+                                "You can access this mailbox's webmail interface at https://outlook.office.com/$emailAddressToBeDecommissioned ."
+                                ""
+                                "If so desired, you can add this mailbox to the left sidebar of "    + `
+                                "Outlook on your computer by doing the following: Within Outlook, "  + `
+                                "go to File -> Account Settings -> Account Settings -> Change -> "   + `
+                                " More Settings -> Advanced -> Add .  Then, type " + `
+                                "'$emailAddressToBeDecommissioned' as the address of the mailbox that you want to add."
+                                ""
+                                ""
+                                "Sincerely,"
+                                "Neil Jackson"
+                                "neil@autoscaninc.com"
+                                "425-218-6726 (cell)"
+                                "206-282-1616 ext. 102 (office)"
+                                ""
+                                "Autoscan, Inc."
+                                "4040 23RD AVE W"
+                                "SEATTLE WA 98199-1209"
+                                "206-282-1616"
+                            ) -Join "`n"
+        }
+        sendMail @xx
     }
     
 }
@@ -220,4 +339,6 @@ End {
 }
 
 
+# Verbiage describing how to connect to an additional mailbox in outlook, and how to delete the inbox rule:
+# To turn off the rule that is forwarding messages into your mailbox, go to https://outlook.office.com/mail/luke@coterraengineering.com/options/mail/rules and click the button to turn off the “redirect_to_peter” rule.
 
